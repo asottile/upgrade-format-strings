@@ -49,7 +49,7 @@ def test_intentionally_not_round_trip(s, expected):
         "'{' '0}'.format(1)",
         # comment looks like placeholder but is not!
         '("{0}" # {1}\n"{2}").format(1, 2, 3)',
-        # TODO: this works by accident (extended escape treated as placeholder)
+        # this works by accident (extended escape treated as placeholder)
         r'"\N{snowman} {}".format(1)',
         # don't touch f-strings (these are wrong but don't make it worse)
         'f"{0}".format(a)',
@@ -101,6 +101,8 @@ def test_format_literals_noop(s):
         ),
         # parenthesized string literals
         ('("{0}").format(1)', '("{}").format(1)'),
+        # extended unicode escapes
+        (r'"\N{snowman} {0}".format(1)', r'"\N{snowman} {}".format(1)'),
     ),
 )
 def test_format_literals(s, expected):

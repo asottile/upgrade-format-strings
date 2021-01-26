@@ -72,8 +72,22 @@ def parse_format(s: str) -> Tuple[DotFormatPart, ...]:
     parsed = tuple(_stdlib_parse_format(s))
     if not parsed:
         return ((s, None, None, None),)
-    else:
-        return parsed
+    collapse_part = None
+    new_parsed = []
+    for part in parsed:
+        fragment, fmtkey, _, _ = part
+        if collapse_part:
+            fragment = collapse_part[0] + fragment
+            part = (fragment,) + part[1:]
+            collapse_part = None
+        # rebuild \N escape seqs
+        if ENDS_ON_NAMED_UNICODE_RE.search(fragment) and fmtkey:
+            collapse_part = (fragment + '{' + fmtkey + '}', None, None, None)
+        if collapse_part is None:
+            new_parsed.append(part)
+    if collapse_part:
+        new_parsed.append(collapse_part)
+    return tuple(new_parsed)
 
 
 def unparse_parsed_string(parsed: Sequence[DotFormatPart]) -> str:
@@ -81,6 +95,9 @@ def unparse_parsed_string(parsed: Sequence[DotFormatPart]) -> str:
         ret, field_name, format_spec, conversion = tup
         ret = ret.replace('{', '{{')
         ret = ret.replace('}', '}}')
+        if r'\N' in ret:
+            # Convert \N{{snowman}} back to \N{snowman}
+            ret = NAMED_UNICODE_RE.sub(r'\\N{\1}', ret)
         if field_name is not None:
             ret += '{' + field_name
             if conversion:
@@ -937,10 +954,16 @@ def _simplify_conversion_flag(flag: str) -> str:
     return ''.join(parts)
 
 
+NAMED_UNICODE_RE = re.compile(r'(?<!\\)(?:\\\\)*\\N{{([^}]+)}}')
+
+
 def _percent_to_format(s: str) -> str:
     def _handle_part(part: PercentFormat) -> str:
         s, fmt = part
         s = s.replace('{', '{{').replace('}', '}}')
+        if r'\N' in s:
+            # Convert \N{{snowman}} back to \N{snowman}
+            s = NAMED_UNICODE_RE.sub(r'\\N{\1}', s)
         if fmt is None:
             return s
         else:
@@ -1076,10 +1099,6 @@ def _fix_percent_format(contents_text: str) -> str:
     for i, token in reversed_enumerate(tokens):
         node = visitor.found.get(token.offset)
         if node is None:
-            continue
-
-        # TODO: handle \N escape sequences
-        if r'\N' in token.src:
             continue
 
         if isinstance(node.right, ast.Tuple):
@@ -2646,6 +2665,9 @@ def _unparse(node: ast.expr) -> str:
         raise NotImplementedError(ast.dump(node))
 
 
+ENDS_ON_NAMED_UNICODE_RE = re.compile(r'(?<!\\)(?:\\\\)*\\N$')
+
+
 def _to_fstring(src: str, call: ast.Call) -> str:
     params = _format_params(call)
 
@@ -2708,10 +2730,6 @@ def _fix_py36_plus(contents_text: str) -> str:
         if token.offset in visitor.fstrings:
             node = visitor.fstrings[token.offset]
 
-            # TODO: handle \N escape sequences
-            if r'\N' in token.src:
-                continue
-
             paren = i + 3
             if tokens_to_src(tokens[i + 1:paren + 1]) != '.format(':
                 continue
@@ -2723,8 +2741,11 @@ def _fix_py36_plus(contents_text: str) -> str:
             if tokens[end].line != token.line:
                 continue
 
-            tokens[i] = token._replace(src=_to_fstring(token.src, node))
-            del tokens[i + 1:end + 1]
+            try:
+                tokens[i] = token._replace(src=_to_fstring(token.src, node))
+                del tokens[i + 1:end + 1]
+            except KeyError:
+                pass
         elif token.offset in visitor.named_tuples and token.name == 'NAME':
             call = visitor.named_tuples[token.offset]
             types: Dict[str, ast.expr] = {
