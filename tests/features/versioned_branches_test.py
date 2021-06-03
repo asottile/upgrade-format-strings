@@ -415,6 +415,20 @@ def test_fix_py2_block_noop(s):
 
             id='elif six.PY3 no else',
         ),
+        pytest.param(
+            'if True:\n'
+            '    if sys.version_info > (3,):\n'
+            '        print(3)\n'
+            '    # comment\n'
+            '    print(2+3)\n',
+
+            'if True:\n'
+            '    print(3)\n'
+            '    # comment\n'
+            '    print(2+3)\n',
+
+            id='comment after dedented block',
+        ),
     ),
 )
 def test_fix_py2_blocks(s, expected):
