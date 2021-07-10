@@ -347,6 +347,17 @@ def test_fix_six_noop(s):
             '(x < y).values()',
             id='needs parentehsizing for Compare',
         ),
+        pytest.param(
+            'x = six.itervalues(\n'
+            '    # comment\n'
+            '    x,\n'
+            ')',
+            'x = (\n'
+            '    # comment\n'
+            '    x,\n'
+            ').values()',
+            id='multiline first argument with comment',
+        ),
     ),
 )
 def test_fix_six(s, expected):
