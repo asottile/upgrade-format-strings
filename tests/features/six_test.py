@@ -126,6 +126,16 @@ def test_fix_six_noop(s):
             'six.raise_from(exc, exc_from)\n',
             'raise exc from exc_from\n',
         ),
+        pytest.param(
+            'six.raise_from(\n'
+            '    e,\n'
+            '    f,\n'
+            ')',
+
+            'raise e from f',
+
+            id='six raise_from across multiple lines',
+        ),
         (
             'six.reraise(tp, exc, tb)\n',
             'raise exc.with_traceback(tb)\n',
