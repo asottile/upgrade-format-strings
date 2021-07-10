@@ -2,30 +2,31 @@ import ast
 import collections
 import contextlib
 import functools
-from typing import Any
 from typing import Dict
 from typing import Generator
 from typing import Iterable
 from typing import List
 from typing import Set
 from typing import Tuple
-from typing import Type
-from typing import Union
 
 from tokenize_rt import Offset
 from tokenize_rt import Token
 from tokenize_rt import tokens_to_src
 
 from pyupgrade._ast_helpers import ast_to_offset
+from pyupgrade._ast_helpers import targets_same
 from pyupgrade._data import register
 from pyupgrade._data import State
 from pyupgrade._data import TokenFunc
 from pyupgrade._token_helpers import Block
 from pyupgrade._token_helpers import find_and_replace_call
 from pyupgrade._token_helpers import find_block_start
+from pyupgrade._token_helpers import find_open_paren
 from pyupgrade._token_helpers import find_token
+from pyupgrade._token_helpers import parse_call_args
 
 FUNC_TYPES = (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)
+NON_LAMBDA_FUNC_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 
 def _fix_yield(i: int, tokens: List[Token]) -> None:
@@ -36,44 +37,27 @@ def _fix_yield(i: int, tokens: List[Token]) -> None:
     tokens[i:block.end] = [Token('CODE', f'yield from {container}\n')]
 
 
-def _all_isinstance(
-        vals: Iterable[Any],
-        tp: Union[Type[Any], Tuple[Type[Any], ...]],
-) -> bool:
-    return all(isinstance(v, tp) for v in vals)
-
-
-def _fields_same(n1: ast.AST, n2: ast.AST) -> bool:
-    for (a1, v1), (a2, v2) in zip(ast.iter_fields(n1), ast.iter_fields(n2)):
-        # ignore ast attributes, they'll be covered by walk
-        if a1 != a2:
-            return False
-        elif _all_isinstance((v1, v2), ast.AST):
-            continue
-        elif _all_isinstance((v1, v2), (list, tuple)):
-            if len(v1) != len(v2):
-                return False
-            # ignore sequences which are all-ast, they'll be covered by walk
-            elif _all_isinstance(v1, ast.AST) and _all_isinstance(v2, ast.AST):
-                continue
-            elif v1 != v2:
-                return False
-        elif v1 != v2:
-            return False
-    return True
-
-
-def _targets_same(target: ast.AST, yield_value: ast.AST) -> bool:
-    for t1, t2 in zip(ast.walk(target), ast.walk(yield_value)):
-        # ignore `ast.Load` / `ast.Store`
-        if _all_isinstance((t1, t2), ast.expr_context):
-            continue
-        elif type(t1) != type(t2):
-            return False
-        elif not _fields_same(t1, t2):
-            return False
+def _fix_old_super(i: int, tokens: List[Token]) -> None:
+    j = find_open_paren(tokens, i)
+    k = j - 1
+    while tokens[k].src != '.':
+        k -= 1
+    func_args, end = parse_call_args(tokens, j)
+    # remove the first argument
+    if len(func_args) == 1:
+        del tokens[func_args[0][0]:func_args[0][0] + 1]
     else:
-        return True
+        del tokens[func_args[0][0]:func_args[1][0] + 1]
+    tokens[i:k] = [Token('CODE', 'super()')]
+
+
+def _is_simple_base(base: ast.AST) -> bool:
+    return (
+        isinstance(base, ast.Name) or (
+            isinstance(base, ast.Attribute) and
+            _is_simple_base(base.value)
+        )
+    )
 
 
 class Scope:
@@ -92,6 +76,7 @@ class Visitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self._scopes: List[Scope] = []
         self.super_offsets: Set[Offset] = set()
+        self.old_super_offsets: Set[Offset] = set()
         self.yield_offsets: Set[Offset] = set()
 
     @contextlib.contextmanager
@@ -137,7 +122,6 @@ class Visitor(ast.NodeVisitor):
                 len(node.args) == 2 and
                 isinstance(node.args[0], ast.Name) and
                 isinstance(node.args[1], ast.Name) and
-                # there are at least two scopes
                 len(self._scopes) >= 2 and
                 # the second to last scope is the class in arg1
                 isinstance(self._scopes[-2].node, ast.ClassDef) and
@@ -148,6 +132,28 @@ class Visitor(ast.NodeVisitor):
                 node.args[1].id == self._scopes[-1].node.args.args[0].arg
         ):
             self.super_offsets.add(ast_to_offset(node))
+        elif (
+                # base.funcname(funcarg1, ...)
+                isinstance(node.func, ast.Attribute) and
+                len(node.args) >= 1 and
+                isinstance(node.args[0], ast.Name) and
+                len(self._scopes) >= 2 and
+                # last stack is a function whose first argument is the first
+                # argument of this function
+                isinstance(self._scopes[-1].node, NON_LAMBDA_FUNC_TYPES) and
+                node.func.attr == self._scopes[-1].node.name and
+                len(self._scopes[-1].node.args.args) >= 1 and
+                node.args[0].id == self._scopes[-1].node.args.args[0].arg and
+                # the function is an attribute of the contained class name
+                isinstance(self._scopes[-2].node, ast.ClassDef) and
+                len(self._scopes[-2].node.bases) == 1 and
+                _is_simple_base(self._scopes[-2].node.bases[0]) and
+                targets_same(
+                    self._scopes[-2].node.bases[0],
+                    node.func.value,
+                )
+        ):
+            self.old_super_offsets.add(ast_to_offset(node))
 
         self.generic_visit(node)
 
@@ -159,7 +165,7 @@ class Visitor(ast.NodeVisitor):
             isinstance(node.body[0], ast.Expr) and
             isinstance(node.body[0].value, ast.Yield) and
             node.body[0].value.value is not None and
-            _targets_same(node.target, node.body[0].value.value) and
+            targets_same(node.target, node.body[0].value.value) and
             not node.orelse
         ):
             offset = ast_to_offset(node)
@@ -197,6 +203,9 @@ def visit_Module(
     super_func = functools.partial(find_and_replace_call, template='super()')
     for offset in visitor.super_offsets:
         yield offset, super_func
+
+    for offset in visitor.old_super_offsets:
+        yield offset, _fix_old_super
 
     for offset in visitor.yield_offsets:
         yield offset, _fix_yield
